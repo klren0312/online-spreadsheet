@@ -1,0 +1,24 @@
+{
+  "name": "online-excel-client",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "vue": "^3.4.15",
+    "pinia": "^2.1.7",
+    "yjs": "^13.6.10",
+    "y-websocket": "^2.0.2",
+    "y-indexeddb": "^9.0.11"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.0.3",
+    "typescript": "^5.3.3",
+    "vite": "^5.0.12",
+    "vue-tsc": "^1.8.27"
+  }
+}
