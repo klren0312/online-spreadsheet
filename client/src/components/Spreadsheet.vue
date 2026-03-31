@@ -21,7 +21,8 @@ const ycells = ydoc.getMap<Y.Map<string>>('cells')
 const ymerges = ydoc.getArray<string>('merges')
 let provider: WebsocketProvider | null = null
 
-const cells = reactive(new Map<string, string>())
+const cells = ref(new Map<string, string>())
+const forceUpdate = ref(0)
 const merges = reactive<Array<{ startRow: number; startCol: number; endRow: number; endCol: number }>>([])
 
 const selectedCell = ref<{ row: number; col: number } | null>(null)
@@ -36,10 +37,21 @@ const otherCursors = reactive(new Map<number, { row: number; col: number; color:
 
 const inputProxy = ref<HTMLDivElement | null>(null)
 
+const clipboard = ref<string[][]>([])
+const clipboardStartCell = ref<{ row: number; col: number } | null>(null)
+const isCut = ref(false)
+
+const contextMenu = ref<{ visible: boolean; x: number; y: number }>({
+  visible: false,
+  x: 0,
+  y: 0
+})
+
 const getCellKey = (row: number, col: number) => `${row}-${col}`
 
 const getCellValue = (row: number, col: number): string => {
-  return cells.get(getCellKey(row, col)) || ''
+  forceUpdate.value
+  return cells.value.get(getCellKey(row, col)) || ''
 }
 
 const getMergeInfo = (row: number, col: number) => {
@@ -213,8 +225,8 @@ const syncCellsFromYjs = () => {
     const value = cellMap.get('value') || ''
     newCells.set(key, value)
   })
-  cells.clear()
-  newCells.forEach((v, k) => cells.set(k, v))
+  cells.value = newCells
+  forceUpdate.value++
 }
 
 const syncMergesFromYjs = () => {
@@ -250,6 +262,8 @@ const selectCell = (row: number, col: number) => {
 }
 
 const handleMouseDown = (row: number, col: number, e: MouseEvent) => {
+  if (e.button === 2) return
+
   if (editingCell.value) {
     finishEditing()
   }
@@ -261,6 +275,8 @@ const handleMouseDown = (row: number, col: number, e: MouseEvent) => {
     selectCell(row, col)
     isSelecting.value = true
   }
+
+  hideContextMenu()
 
   nextTick(() => {
     focusInputProxy()
@@ -282,6 +298,125 @@ const handleMouseUp = () => {
 
 const handleCellDblClick = (row: number, col: number) => {
   startEditing(row, col)
+}
+
+const handleContextMenu = (e: MouseEvent, row: number, col: number) => {
+  e.preventDefault()
+
+  if (!isInSelection(row, col)) {
+    selectCell(row, col)
+  }
+
+  contextMenu.value = {
+    visible: true,
+    x: e.clientX,
+    y: e.clientY
+  }
+}
+
+const hideContextMenu = () => {
+  contextMenu.value.visible = false
+}
+
+const handleContextAction = (action: string) => {
+  switch (action) {
+    case 'cut':
+      cutSelection()
+      break
+    case 'copy':
+      copySelection()
+      break
+    case 'paste':
+      pasteSelection()
+      break
+    case 'delete':
+      deleteSelection()
+      break
+  }
+  hideContextMenu()
+}
+
+const copySelection = () => {
+  if (!selectionRange.value) return
+
+  const { startRow, endRow, startCol, endCol } = selectionRange.value
+  const data: string[][] = []
+
+  for (let r = startRow; r <= endRow; r++) {
+    const row: string[] = []
+    for (let c = startCol; c <= endCol; c++) {
+      row.push(getCellValue(r, c))
+    }
+    data.push(row)
+  }
+
+  clipboard.value = data
+  clipboardStartCell.value = { row: startRow, col: startCol }
+
+  const text = data.map(row => row.join('\t')).join('\n')
+  navigator.clipboard.writeText(text)
+
+  isCut.value = false
+}
+
+const cutSelection = () => {
+  copySelection()
+  isCut.value = true
+}
+
+const pasteSelection = () => {
+  if (!selectedCell.value) return
+  if (clipboard.value.length === 0) return
+
+  const { row: startRow, col: startCol } = selectedCell.value
+
+  ydoc.transact(() => {
+    for (let r = 0; r < clipboard.value.length; r++) {
+      for (let c = 0; c < clipboard.value[r].length; c++) {
+        const targetRow = startRow + r
+        const targetCol = startCol + c
+
+        if (targetRow <= ROWS && targetCol < COLS) {
+          setCellValue(targetRow, targetCol, clipboard.value[r][c])
+        }
+      }
+    }
+
+    if (isCut.value && clipboardStartCell.value) {
+      for (let r = 0; r < clipboard.value.length; r++) {
+        for (let c = 0; c < clipboard.value[r].length; c++) {
+          const sourceRow = clipboardStartCell.value.row + r
+          const sourceCol = clipboardStartCell.value.col + c
+
+          if (sourceRow !== startRow + r || sourceCol !== startCol + c) {
+            if (sourceRow <= ROWS && sourceCol < COLS) {
+              setCellValue(sourceRow, sourceCol, '')
+            }
+          }
+        }
+      }
+      isCut.value = false
+    }
+  })
+}
+
+const deleteSelection = () => {
+  if (selectionRange.value) {
+    const { startRow, endRow, startCol, endCol } = selectionRange.value
+
+    for (let r = startRow; r <= endRow; r++) {
+      for (let c = startCol; c <= endCol; c++) {
+        setCellValue(r, c, '')
+      }
+    }
+  } else if (selectedCell.value) {
+    setCellValue(selectedCell.value.row, selectedCell.value.col, '')
+  }
+}
+
+const selectAll = () => {
+  selectionStart.value = { row: 1, col: 0 }
+  selectionEnd.value = { row: ROWS, col: COLS - 1 }
 }
 
 const focusInputProxy = () => {
@@ -350,22 +485,67 @@ const handleInputProxyKeyDown = (e: KeyboardEvent) => {
 
   const { row, col } = selectedCell.value
 
+  if (e.ctrlKey || e.metaKey) {
+    switch (e.key.toLowerCase()) {
+      case 'c':
+        e.preventDefault()
+        copySelection()
+        return
+      case 'x':
+        e.preventDefault()
+        cutSelection()
+        return
+      case 'v':
+        e.preventDefault()
+        pasteSelection()
+        return
+      case 'a':
+        e.preventDefault()
+        selectAll()
+        return
+    }
+  }
+
   switch (e.key) {
     case 'ArrowUp':
       e.preventDefault()
-      if (row > 1) selectCell(row - 1, col)
+      if (e.shiftKey) {
+        if (selectionEnd.value && selectionEnd.value.row > 1) {
+          selectionEnd.value = { row: selectionEnd.value.row - 1, col: selectionEnd.value.col }
+        }
+      } else {
+        if (row > 1) selectCell(row - 1, col)
+      }
       break
     case 'ArrowDown':
       e.preventDefault()
-      if (row < ROWS) selectCell(row + 1, col)
+      if (e.shiftKey) {
+        if (selectionEnd.value && selectionEnd.value.row < ROWS) {
+          selectionEnd.value = { row: selectionEnd.value.row + 1, col: selectionEnd.value.col }
+        }
+      } else {
+        if (row < ROWS) selectCell(row + 1, col)
+      }
       break
     case 'ArrowLeft':
       e.preventDefault()
-      if (col > 0) selectCell(row, col - 1)
+      if (e.shiftKey) {
+        if (selectionEnd.value && selectionEnd.value.col > 0) {
+          selectionEnd.value = { row: selectionEnd.value.row, col: selectionEnd.value.col - 1 }
+        }
+      } else {
+        if (col > 0) selectCell(row, col - 1)
+      }
       break
     case 'ArrowRight':
       e.preventDefault()
-      if (col < COLS - 1) selectCell(row, col + 1)
+      if (e.shiftKey) {
+        if (selectionEnd.value && selectionEnd.value.col < COLS - 1) {
+          selectionEnd.value = { row: selectionEnd.value.row, col: selectionEnd.value.col + 1 }
+        }
+      } else {
+        if (col < COLS - 1) selectCell(row, col + 1)
+      }
       break
     case 'Enter':
       e.preventDefault()
@@ -374,15 +554,7 @@ const handleInputProxyKeyDown = (e: KeyboardEvent) => {
     case 'Delete':
     case 'Backspace':
       e.preventDefault()
-      if (selectionRange.value) {
-        for (let r = selectionRange.value.startRow; r <= selectionRange.value.endRow; r++) {
-          for (let c = selectionRange.value.startCol; c <= selectionRange.value.endCol; c++) {
-            setCellValue(r, c, '')
-          }
-        }
-      } else {
-        setCellValue(row, col, '')
-      }
+      deleteSelection()
       break
     case 'Tab':
       e.preventDefault()
@@ -483,17 +655,19 @@ onMounted(() => {
     updateCollaborators()
   })
 
-  ycells.observe(syncCellsFromYjs)
-  ymerges.observe(syncMergesFromYjs)
+  ycells.observeDeep(syncCellsFromYjs)
+  ymerges.observeDeep(syncMergesFromYjs)
   syncCellsFromYjs()
   syncMergesFromYjs()
 
   focusInputProxy()
   document.addEventListener('mouseup', handleMouseUp)
+  document.addEventListener('click', hideContextMenu)
 })
 
 onUnmounted(() => {
   document.removeEventListener('mouseup', handleMouseUp)
+  document.removeEventListener('click', hideContextMenu)
   if (provider) {
     provider.disconnect()
     provider.destroy()
@@ -514,6 +688,34 @@ onUnmounted(() => {
     <div class="toolbar">
       <button
         class="toolbar-btn"
+        @click="copySelection"
+        title="复制 (Ctrl+C)"
+      >
+        <svg viewBox="0 0 24 24" width="18" height="18">
+          <path fill="currentColor" d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/>
+        </svg>
+      </button>
+      <button
+        class="toolbar-btn"
+        @click="cutSelection"
+        title="剪切 (Ctrl+X)"
+      >
+        <svg viewBox="0 0 24 24" width="18" height="18">
+          <path fill="currentColor" d="M9.64 7.64c.23-.5.36-1.05.36-1.64 0-2.21-1.79-4-4-4S2 3.79 2 6s1.79 4 4 4c.59 0 1.14-.13 1.64-.36L10 12l-2.36 2.36C7.14 14.13 6.59 14 6 14c-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4c0-.59-.13-1.14-.36-1.64L12 14l7 7h3v-1L9.64 7.64zM6 8c-1.1 0-2-.89-2-2s.9-2 2-2 2 .89 2 2-.9 2-2 2zm0 12c-1.1 0-2-.89-2-2s.9-2 2-2 2 .89 2 2-.9 2-2 2zm6-7.5c-.28 0-.5-.22-.5-.5s.22-.5.5-.5.5.22.5.5-.22.5-.5.5zM19 3l-6 6 2 2 7-7V3h-3z"/>
+        </svg>
+      </button>
+      <button
+        class="toolbar-btn"
+        @click="pasteSelection"
+        title="粘贴 (Ctrl+V)"
+      >
+        <svg viewBox="0 0 24 24" width="18" height="18">
+          <path fill="currentColor" d="M19 2h-4.18C14.4.84 13.3 0 12 0c-1.3 0-2.4.84-2.82 2H5c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-7 0c.55 0 1 .45 1 1s-.45 1-1 1-1-.45-1-1 .45-1 1-1zm7 18H5V4h2v3h10V4h2v16z"/>
+        </svg>
+      </button>
+      <div class="toolbar-divider"></div>
+      <button
+        class="toolbar-btn"
         :class="{ disabled: !canMerge }"
         :disabled="!canMerge"
         @click="mergeCells"
@@ -522,7 +724,7 @@ onUnmounted(() => {
         <svg viewBox="0 0 24 24" width="18" height="18">
           <path fill="currentColor" d="M3 5v14h18V5H3zm16 12H5V7h14v10zM8 13h3v-2H8V8l-4 4 4 4v-3zm8-2h-3v2h3v3l4-4-4-4v3z"/>
         </svg>
-        <span>合并单元格</span>
+        <span>合并</span>
       </button>
       <button
         class="toolbar-btn"
@@ -539,8 +741,8 @@ onUnmounted(() => {
       <div class="toolbar-divider"></div>
       <button
         class="toolbar-btn"
-        title="清除选中内容"
-        @click="() => { if(selectionRange) { for(let r = selectionRange.startRow; r <= selectionRange.endRow; r++) { for(let c = selectionRange.startCol; c <= selectionRange.endCol; c++) { setCellValue(r, c, '') } } } }"
+        @click="deleteSelection"
+        title="删除 (Delete)"
       >
         <svg viewBox="0 0 24 24" width="18" height="18">
           <path fill="currentColor" d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
@@ -572,6 +774,7 @@ onUnmounted(() => {
                   @mousedown="handleMouseDown(row, colIdx, $event)"
                   @mousemove="handleMouseMove(row, colIdx)"
                   @dblclick="handleCellDblClick(row, colIdx)"
+                  @contextmenu="handleContextMenu($event, row, colIdx)"
                 >
                   <div
                     v-if="getCursorLabel(row, colIdx)"
@@ -594,6 +797,42 @@ onUnmounted(() => {
             </tr>
           </tbody>
         </table>
+      </div>
+    </div>
+    <div
+      v-if="contextMenu.visible"
+      class="context-menu"
+      :style="{ left: contextMenu.x + 'px', top: contextMenu.y + 'px' }"
+      @mousedown.stop
+    >
+      <div class="context-menu-item" @mousedown="handleContextAction('cut')">
+        <svg viewBox="0 0 24 24" width="16" height="16">
+          <path fill="currentColor" d="M9.64 7.64c.23-.5.36-1.05.36-1.64 0-2.21-1.79-4-4-4S2 3.79 2 6s1.79 4 4 4c.59 0 1.14-.13 1.64-.36L10 12l-2.36 2.36C7.14 14.13 6.59 14 6 14c-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4c0-.59-.13-1.14-.36-1.64L12 14l7 7h3v-1L9.64 7.64zM6 8c-1.1 0-2-.89-2-2s.9-2 2-2 2 .89 2 2-.9 2-2 2zm0 12c-1.1 0-2-.89-2-2s.9-2 2-2 2 .89 2 2-.9 2-2 2zm6-7.5c-.28 0-.5-.22-.5-.5s.22-.5.5-.5.5.22.5.5-.22.5-.5.5zM19 3l-6 6 2 2 7-7V3h-3z"/>
+        </svg>
+        <span>剪切</span>
+        <span class="shortcut">Ctrl+X</span>
+      </div>
+      <div class="context-menu-item" @mousedown="handleContextAction('copy')">
+        <svg viewBox="0 0 24 24" width="16" height="16">
+          <path fill="currentColor" d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/>
+        </svg>
+        <span>复制</span>
+        <span class="shortcut">Ctrl+C</span>
+      </div>
+      <div class="context-menu-item" @mousedown="handleContextAction('paste')">
+        <svg viewBox="0 0 24 24" width="16" height="16">
+          <path fill="currentColor" d="M19 2h-4.18C14.4.84 13.3 0 12 0c-1.3 0-2.4.84-2.82 2H5c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-7 0c.55 0 1 .45 1 1s-.45 1-1 1-1-.45-1-1 .45-1 1-1zm7 18H5V4h2v3h10V4h2v16z"/>
+        </svg>
+        <span>粘贴</span>
+        <span class="shortcut">Ctrl+V</span>
+      </div>
+      <div class="context-menu-divider"></div>
+      <div class="context-menu-item" @mousedown="handleContextAction('delete')">
+        <svg viewBox="0 0 24 24" width="16" height="16">
+          <path fill="currentColor" d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
+        </svg>
+        <span>清除内容</span>
+        <span class="shortcut">Delete</span>
       </div>
     </div>
   </div>
@@ -635,7 +874,7 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 6px 12px;
+  padding: 6px 10px;
   border: 1px solid var(--border-color);
   border-radius: 4px;
   background: white;
@@ -796,5 +1035,47 @@ onUnmounted(() => {
   white-space: nowrap;
   z-index: 10;
   pointer-events: none;
+}
+
+.context-menu {
+  position: fixed;
+  background: white;
+  border: 1px solid #e0e0e0;
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  padding: 4px 0;
+  min-width: 180px;
+  z-index: 1000;
+}
+
+.context-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+  font-size: 13px;
+  color: #333;
+}
+
+.context-menu-item:hover {
+  background: #f0f0f0;
+}
+
+.context-menu-item svg {
+  flex-shrink: 0;
+  color: #666;
+}
+
+.context-menu-item .shortcut {
+  margin-left: auto;
+  font-size: 11px;
+  color: #999;
+}
+
+.context-menu-divider {
+  height: 1px;
+  background: #e0e0e0;
+  margin: 4px 0;
 }
 </style>
