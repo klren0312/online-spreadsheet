@@ -10,6 +10,7 @@ interface CellStyle {
   fontWeight?: string
   textDecoration?: string
   textAlign?: string
+  image?: string  // base64 图片数据
 }
 
 const props = defineProps<{
@@ -153,6 +154,107 @@ const handleRowResizeEnd = () => {
   resizingRow.value = null
   document.removeEventListener('mousemove', handleRowResizing)
   document.removeEventListener('mouseup', handleRowResizeEnd)
+}
+
+// 图片处理
+const imageInput = ref<HTMLInputElement | null>(null)
+
+const handleImageUpload = (e: Event) => {
+  const input = e.target as HTMLInputElement
+  if (!input.files || input.files.length === 0) return
+
+  const file = input.files[0]
+  if (!file.type.startsWith('image/')) return
+
+  const reader = new FileReader()
+  reader.onload = () => {
+    if (selectedCell.value && typeof reader.result === 'string') {
+      applyStyle('image', reader.result)
+    }
+  }
+  reader.readAsDataURL(file)
+
+  // 清空 input 以便重复选择同一文件
+  input.value = ''
+}
+
+const openImageUpload = () => {
+  if (!selectedCell.value) return
+  imageInput.value?.click()
+}
+
+const handleDocumentKeyDown = (e: KeyboardEvent) => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') {
+    e.preventDefault()
+    handleCtrlV()
+  }
+}
+
+const handleCtrlV = async () => {
+  if (!selectedCell.value) return
+
+  try {
+    // 尝试读取图片
+    const items = await navigator.clipboard.read()
+    for (const item of items) {
+      for (const type of item.types) {
+        if (type.startsWith('image/')) {
+          const blob = await item.getType(type)
+          const reader = new FileReader()
+          reader.onload = () => {
+            if (typeof reader.result === 'string') {
+              applyStyle('image', reader.result)
+            }
+          }
+          reader.readAsDataURL(blob)
+          return
+        }
+      }
+    }
+  } catch (err) {
+    // Clipboard API 不可用
+  }
+
+  // 尝试读取文字
+  try {
+    const text = await navigator.clipboard.readText()
+    if (text) {
+      // 解析制表符分隔的文本
+      const rows = text.split('\n').map(row => row.split('\t'))
+      const { row: startRow, col: startCol } = selectedCell.value
+
+      ydoc.transact(() => {
+        for (let r = 0; r < rows.length; r++) {
+          for (let c = 0; c < rows[r].length; c++) {
+            const targetRow = startRow + r
+            const targetCol = startCol + c
+            if (targetRow <= ROWS && targetCol < COLS) {
+              setCellValue(targetRow, targetCol, rows[r][c])
+            }
+          }
+        }
+      })
+      return
+    }
+  } catch (err) {
+    // 无法读取剪贴板文字
+  }
+
+  // 使用内部剪贴板
+  pasteSelection()
+}
+
+const removeImage = () => {
+  if (!selectedCell.value) return
+  const { row, col } = selectedCell.value
+  const key = getCellKey(row, col)
+
+  ydoc.transact(() => {
+    let cellMap = ycells.get(key)
+    if (cellMap) {
+      cellMap.delete('image')
+    }
+  })
 }
 
 const contextMenu = ref<{ visible: boolean; x: number; y: number }>({
@@ -347,6 +449,7 @@ const syncCellsFromYjs = () => {
     const fontWeight = cellMap.get('fontWeight')
     const textDecoration = cellMap.get('textDecoration')
     const textAlign = cellMap.get('textAlign')
+    const image = cellMap.get('image')
 
     if (color) style.color = color
     if (bgColor) style.bgColor = bgColor
@@ -354,6 +457,7 @@ const syncCellsFromYjs = () => {
     if (fontWeight) style.fontWeight = fontWeight
     if (textDecoration) style.textDecoration = textDecoration
     if (textAlign) style.textAlign = textAlign
+    if (image) style.image = image
 
     if (Object.keys(style).length > 0) {
       newStyles.set(key, style)
@@ -440,9 +544,20 @@ const setCellStyle = (row: number, col: number, styleKey: string, value: any) =>
 }
 
 const applyStyle = (styleKey: string, value: any) => {
-  if (!selectionRange.value) return
+  let startRow: number, endRow: number, startCol: number, endCol: number
 
-  const { startRow, endRow, startCol, endCol } = selectionRange.value
+  if (selectionRange.value) {
+    const range = selectionRange.value
+    startRow = range.startRow
+    endRow = range.endRow
+    startCol = range.startCol
+    endCol = range.endCol
+  } else if (selectedCell.value) {
+    startRow = endRow = selectedCell.value.row
+    startCol = endCol = selectedCell.value.col
+  } else {
+    return
+  }
 
   ydoc.transact(() => {
     for (let r = startRow; r <= endRow; r++) {
@@ -542,8 +657,24 @@ const handleMouseUp = () => {
   })
 }
 
+const previewImage = ref<string | null>(null)
+
 const handleCellDblClick = (row: number, col: number) => {
+  const key = getCellKey(row, col)
+  const style = cellStyles.value.get(key)
+
+  // 如果有图片，显示预览
+  if (style?.image) {
+    previewImage.value = style.image
+    return
+  }
+
+  // 否则进入编辑模式
   startEditing(row, col)
+}
+
+const closePreview = () => {
+  previewImage.value = null
 }
 
 const handleContextMenu = (e: MouseEvent, row: number, col: number) => {
@@ -603,7 +734,34 @@ const copySelection = () => {
   const text = data.map(row => row.join('\t')).join('\n')
   navigator.clipboard.writeText(text)
 
+  // 复制图片到剪贴板
+  copyImageToClipboard()
+
   isCut.value = false
+}
+
+const copyImageToClipboard = async () => {
+  if (!selectionRange.value) return
+
+  const { startRow, startCol } = selectionRange.value
+
+  // 如果只有一个单元格包含图片，复制该图片
+  if (startRow === selectionRange.value.endRow && startCol === selectionRange.value.endCol) {
+    const key = getCellKey(startRow, startCol)
+    const style = cellStyles.value.get(key)
+    if (style?.image) {
+      try {
+        // 将 base64 转换为 blob
+        const response = await fetch(style.image)
+        const blob = await response.blob()
+        await navigator.clipboard.write([
+          new ClipboardItem({ [blob.type]: blob })
+        ])
+      } catch (err) {
+        console.error('Failed to copy image:', err)
+      }
+    }
+  }
 }
 
 const cutSelection = () => {
@@ -744,7 +902,7 @@ const handleInputProxyKeyDown = (e: KeyboardEvent) => {
         return
       case 'v':
         e.preventDefault()
-        pasteSelection()
+        handleCtrlV()
         return
       case 'a':
         e.preventDefault()
@@ -938,11 +1096,13 @@ onMounted(() => {
   focusInputProxy()
   document.addEventListener('mouseup', handleMouseUp)
   document.addEventListener('click', hideContextMenu)
+  document.addEventListener('keydown', handleDocumentKeyDown)
 })
 
 onUnmounted(() => {
   document.removeEventListener('mouseup', handleMouseUp)
   document.removeEventListener('click', hideContextMenu)
+  document.removeEventListener('keydown', handleDocumentKeyDown)
   if (provider) {
     provider.disconnect()
     provider.destroy()
@@ -1128,15 +1288,32 @@ onUnmounted(() => {
       </button>
       <button
         class="toolbar-btn"
-        :class="{ active: getCurrentCellStyle().textAlign === 'right' }"
-        @click="applyStyle('textAlign', 'right')"
-        title="右对齐"
+        :class="{ active: !!getCurrentCellStyle().image }"
+        @click="openImageUpload"
+        title="插入图片"
       >
         <svg viewBox="0 0 24 24" width="18" height="18">
-          <path fill="currentColor" d="M3 21h18v-2H3v2zm6-4h12v-2H9v2zm-6-4h18v-2H3v2zm6-4h12V7H9v2zM3 3v2h18V3H3z"/>
+          <path fill="currentColor" d="M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"/>
+        </svg>
+      </button>
+      <button
+        v-if="getCurrentCellStyle().image"
+        class="toolbar-btn"
+        @click="removeImage"
+        title="删除图片"
+      >
+        <svg viewBox="0 0 24 24" width="18" height="18">
+          <path fill="currentColor" d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
         </svg>
       </button>
     </div>
+    <input
+      ref="imageInput"
+      type="file"
+      accept="image/*"
+      style="display: none"
+      @change="handleImageUpload"
+    />
     <div class="spreadsheet" tabindex="0" @click="focusInputProxy" @focus="focusInputProxy">
       <div class="spreadsheet-container">
         <table class="spreadsheet-table">
@@ -1196,7 +1373,14 @@ onUnmounted(() => {
                     @blur="finishEditing"
                     @mousedown.stop
                   />
-                  <span v-else class="cell-value">{{ getCellValue(row, colIdx) }}</span>
+                  <template v-else>
+                    <img
+                      v-if="cellStyles.get(getCellKey(row, colIdx))?.image"
+                      :src="cellStyles.get(getCellKey(row, colIdx))?.image"
+                      class="cell-image"
+                    />
+                    <span v-else class="cell-value">{{ getCellValue(row, colIdx) }}</span>
+                  </template>
                 </td>
               </template>
             </tr>
@@ -1238,6 +1422,21 @@ onUnmounted(() => {
         </svg>
         <span>清除内容</span>
         <span class="shortcut">Delete</span>
+      </div>
+    </div>
+    <!-- 图片预览弹窗 -->
+    <div
+      v-if="previewImage"
+      class="image-preview-overlay"
+      @click="closePreview"
+    >
+      <div class="image-preview-content" @click.stop>
+        <img :src="previewImage" alt="预览图片" />
+        <button class="preview-close" @click="closePreview">
+          <svg viewBox="0 0 24 24" width="24" height="24">
+            <path fill="currentColor" d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
+          </svg>
+        </button>
       </div>
     </div>
   </div>
@@ -1519,6 +1718,12 @@ onUnmounted(() => {
   height: 100%;
 }
 
+.cell-image {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
 .cell-input {
   width: 100%;
   height: 100%;
@@ -1584,5 +1789,46 @@ onUnmounted(() => {
   height: 1px;
   background: #e0e0e0;
   margin: 4px 0;
+}
+
+.image-preview-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.8);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+}
+
+.image-preview-content {
+  position: relative;
+  max-width: 90vw;
+  max-height: 90vh;
+}
+
+.image-preview-content img {
+  max-width: 100%;
+  max-height: 90vh;
+  object-fit: contain;
+  border-radius: 4px;
+}
+
+.preview-close {
+  position: absolute;
+  top: -40px;
+  right: 0;
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: white;
+  padding: 8px;
+}
+
+.preview-close:hover {
+  color: #ccc;
 }
 </style>
