@@ -23,17 +23,24 @@ const emit = defineEmits<{
 const ROWS = 100
 const COLS = 26
 
+const DEFAULT_COL_WIDTH = 100
+const DEFAULT_ROW_HEIGHT = 28
+
 const colLetters = Array.from({ length: COLS }, (_, i) => String.fromCharCode(65 + i))
 
 const ydoc = new Y.Doc()
 const ycells = ydoc.getMap<Y.Map<string>>('cells')
 const ymerges = ydoc.getArray<string>('merges')
+const ycolWidths = ydoc.getMap<number>('colWidths')
+const yrowHeights = ydoc.getMap<number>('rowHeights')
 let provider: WebsocketProvider | null = null
 
 const cells = ref(new Map<string, string>())
 const cellStyles = ref(new Map<string, CellStyle>())
 const forceUpdate = ref(0)
 const merges = reactive<Array<{ startRow: number; startCol: number; endRow: number; endCol: number }>>([])
+const colWidths = ref(new Map<number, number>())
+const rowHeights = ref(new Map<number, number>())
 
 const fontSizes = [10, 12, 14, 16, 18, 20, 24, 28, 32]
 const defaultFontSize = 14
@@ -86,6 +93,67 @@ const fontSizeSelect = ref<HTMLSelectElement | null>(null)
 const clipboard = ref<string[][]>([])
 const clipboardStartCell = ref<{ row: number; col: number } | null>(null)
 const isCut = ref(false)
+
+// 列宽/行高调整
+const isResizingCol = ref(false)
+const resizingCol = ref<number | null>(null)
+const resizingStartX = ref(0)
+const resizingStartWidth = ref(0)
+
+const isResizingRow = ref(false)
+const resizingRow = ref<number | null>(null)
+const resizingStartY = ref(0)
+const resizingStartHeight = ref(0)
+
+const handleColResizeStart = (e: MouseEvent, col: number) => {
+  e.preventDefault()
+  e.stopPropagation()
+  isResizingCol.value = true
+  resizingCol.value = col
+  resizingStartX.value = e.clientX
+  resizingStartWidth.value = getColWidth(col)
+  document.addEventListener('mousemove', handleColResizing)
+  document.addEventListener('mouseup', handleColResizeEnd)
+}
+
+const handleColResizing = (e: MouseEvent) => {
+  if (!isResizingCol.value || resizingCol.value === null) return
+  const delta = e.clientX - resizingStartX.value
+  const newWidth = Math.max(30, resizingStartWidth.value + delta)
+  setColWidth(resizingCol.value, newWidth)
+}
+
+const handleColResizeEnd = () => {
+  isResizingCol.value = false
+  resizingCol.value = null
+  document.removeEventListener('mousemove', handleColResizing)
+  document.removeEventListener('mouseup', handleColResizeEnd)
+}
+
+const handleRowResizeStart = (e: MouseEvent, row: number) => {
+  e.preventDefault()
+  e.stopPropagation()
+  isResizingRow.value = true
+  resizingRow.value = row
+  resizingStartY.value = e.clientY
+  resizingStartHeight.value = getRowHeight(row)
+  document.addEventListener('mousemove', handleRowResizing)
+  document.addEventListener('mouseup', handleRowResizeEnd)
+}
+
+const handleRowResizing = (e: MouseEvent) => {
+  if (!isResizingRow.value || resizingRow.value === null) return
+  const delta = e.clientY - resizingStartY.value
+  const newHeight = Math.max(20, resizingStartHeight.value + delta)
+  setRowHeight(resizingRow.value, newHeight)
+}
+
+const handleRowResizeEnd = () => {
+  isResizingRow.value = false
+  resizingRow.value = null
+  document.removeEventListener('mousemove', handleRowResizing)
+  document.removeEventListener('mouseup', handleRowResizeEnd)
+}
 
 const contextMenu = ref<{ visible: boolean; x: number; y: number }>({
   visible: false,
@@ -303,6 +371,42 @@ const syncMergesFromYjs = () => {
     const [startRow, startCol, endRow, endCol] = key.split('-').map(Number)
     merges.push({ startRow, startCol, endRow, endCol })
   }
+}
+
+const syncDimensionsFromYjs = () => {
+  const newColWidths = new Map<number, number>()
+  const newRowHeights = new Map<number, number>()
+
+  ycolWidths.forEach((width, col) => {
+    newColWidths.set(Number(col), width)
+  })
+
+  yrowHeights.forEach((height, row) => {
+    newRowHeights.set(Number(row), height)
+  })
+
+  colWidths.value = newColWidths
+  rowHeights.value = newRowHeights
+}
+
+const getColWidth = (col: number): number => {
+  return colWidths.value.get(col) || DEFAULT_COL_WIDTH
+}
+
+const getRowHeight = (row: number): number => {
+  return rowHeights.value.get(row) || DEFAULT_ROW_HEIGHT
+}
+
+const setColWidth = (col: number, width: number) => {
+  ydoc.transact(() => {
+    ycolWidths.set(col, width)
+  })
+}
+
+const setRowHeight = (row: number, height: number) => {
+  ydoc.transact(() => {
+    yrowHeights.set(row, height)
+  })
 }
 
 const setCellValue = (row: number, col: number, value: string) => {
@@ -767,6 +871,12 @@ const getCellStyle = (row: number, col: number) => {
   const key = getCellKey(row, col)
   const cellStyle = cellStyles.value.get(key)
 
+  // 添加列宽和行高
+  style.width = getColWidth(col) + 'px'
+  style.minWidth = getColWidth(col) + 'px'
+  style.height = getRowHeight(row) + 'px'
+  style.minHeight = getRowHeight(row) + 'px'
+
   if (cellStyle) {
     if (cellStyle.color) style.color = cellStyle.color
     if (cellStyle.bgColor) style.backgroundColor = cellStyle.bgColor
@@ -819,8 +929,11 @@ onMounted(() => {
 
   ycells.observeDeep(syncCellsFromYjs)
   ymerges.observeDeep(syncMergesFromYjs)
+  ycolWidths.observeDeep(syncDimensionsFromYjs)
+  yrowHeights.observeDeep(syncDimensionsFromYjs)
   syncCellsFromYjs()
   syncMergesFromYjs()
+  syncDimensionsFromYjs()
 
   focusInputProxy()
   document.addEventListener('mouseup', handleMouseUp)
@@ -1030,14 +1143,32 @@ onUnmounted(() => {
           <thead>
             <tr>
               <th class="corner-cell"></th>
-              <th v-for="col in colLetters" :key="col" class="col-header">
+              <th
+                v-for="(col, index) in colLetters"
+                :key="col"
+                class="col-header"
+                :style="{ width: getColWidth(index) + 'px', minWidth: getColWidth(index) + 'px' }"
+              >
                 {{ col }}
+                <div
+                  class="col-resize-handle"
+                  @mousedown="handleColResizeStart($event, index)"
+                ></div>
               </th>
             </tr>
           </thead>
           <tbody>
             <tr v-for="row in ROWS" :key="row">
-              <td class="row-header">{{ row }}</td>
+              <td
+                class="row-header"
+                :style="{ height: getRowHeight(row) + 'px', minHeight: getRowHeight(row) + 'px' }"
+              >
+                {{ row }}
+                <div
+                  class="row-resize-handle"
+                  @mousedown="handleRowResizeStart($event, row)"
+                ></div>
+              </td>
               <template v-for="colIdx in COLS" :key="`${row}-${colIdx}`">
                 <td
                   v-if="!shouldHideCell(row, colIdx)"
@@ -1301,6 +1432,21 @@ onUnmounted(() => {
   top: 0;
   z-index: 2;
   user-select: none;
+  position: relative;
+}
+
+.col-header .col-resize-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: 0;
+  width: 4px;
+  cursor: ew-resize;
+  background: transparent;
+}
+
+.col-header .col-resize-handle:hover {
+  background: var(--primary-color);
 }
 
 .row-header {
@@ -1318,10 +1464,21 @@ onUnmounted(() => {
   user-select: none;
 }
 
+.row-header .row-resize-handle {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 4px;
+  cursor: ns-resize;
+  background: transparent;
+}
+
+.row-header .row-resize-handle:hover {
+  background: var(--primary-color);
+}
+
 .cell {
-  width: 100px;
-  min-width: 100px;
-  height: var(--cell-height);
   border: 1px solid var(--border-color);
   padding: 0 4px;
   position: relative;
