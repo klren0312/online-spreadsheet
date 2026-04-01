@@ -3,6 +3,15 @@ import { ref, reactive, onMounted, onUnmounted, nextTick, computed } from 'vue'
 import * as Y from 'yjs'
 import { WebsocketProvider } from 'y-websocket'
 
+interface CellStyle {
+  color?: string
+  bgColor?: string
+  fontSize?: number
+  fontWeight?: string
+  textDecoration?: string
+  textAlign?: string
+}
+
 const props = defineProps<{
   documentId: string
 }>()
@@ -22,8 +31,44 @@ const ymerges = ydoc.getArray<string>('merges')
 let provider: WebsocketProvider | null = null
 
 const cells = ref(new Map<string, string>())
+const cellStyles = ref(new Map<string, CellStyle>())
 const forceUpdate = ref(0)
 const merges = reactive<Array<{ startRow: number; startCol: number; endRow: number; endCol: number }>>([])
+
+const fontSizes = [10, 12, 14, 16, 18, 20, 24, 28, 32]
+const defaultFontSize = 14
+const fontSizeDropdownOpen = ref(false)
+
+// 待应用的颜色值（用于节流）
+let pendingColorValue: { styleKey: string; value: string } | null = null
+let colorThrottleTimer: ReturnType<typeof setTimeout> | null = null
+
+const flushColorChange = () => {
+  if (pendingColorValue) {
+    applyStyle(pendingColorValue.styleKey, pendingColorValue.value)
+    pendingColorValue = null
+  }
+}
+
+const handleColorInput = (styleKey: string, value: string) => {
+  pendingColorValue = { styleKey, value }
+
+  if (!colorThrottleTimer) {
+    colorThrottleTimer = setTimeout(() => {
+      colorThrottleTimer = null
+      flushColorChange()
+    }, 150)
+  }
+}
+
+const handleColorChange = (styleKey: string, value: string) => {
+  if (colorThrottleTimer) {
+    clearTimeout(colorThrottleTimer)
+    colorThrottleTimer = null
+  }
+  pendingColorValue = null
+  applyStyle(styleKey, value)
+}
 
 const selectedCell = ref<{ row: number; col: number } | null>(null)
 const selectionStart = ref<{ row: number; col: number } | null>(null)
@@ -36,6 +81,7 @@ const editValue = ref('')
 const otherCursors = reactive(new Map<number, { row: number; col: number; color: string; name: string }>())
 
 const inputProxy = ref<HTMLDivElement | null>(null)
+const fontSizeSelect = ref<HTMLSelectElement | null>(null)
 
 const clipboard = ref<string[][]>([])
 const clipboardStartCell = ref<{ row: number; col: number } | null>(null)
@@ -221,11 +267,32 @@ const updateCollaborators = () => {
 
 const syncCellsFromYjs = () => {
   const newCells = new Map<string, string>()
+  const newStyles = new Map<string, CellStyle>()
   ycells.forEach((cellMap, key) => {
     const value = cellMap.get('value') || ''
     newCells.set(key, value)
+
+    const style: CellStyle = {}
+    const color = cellMap.get('color')
+    const bgColor = cellMap.get('bgColor')
+    const fontSize = cellMap.get('fontSize')
+    const fontWeight = cellMap.get('fontWeight')
+    const textDecoration = cellMap.get('textDecoration')
+    const textAlign = cellMap.get('textAlign')
+
+    if (color) style.color = color
+    if (bgColor) style.bgColor = bgColor
+    if (fontSize) style.fontSize = Number(fontSize)
+    if (fontWeight) style.fontWeight = fontWeight
+    if (textDecoration) style.textDecoration = textDecoration
+    if (textAlign) style.textAlign = textAlign
+
+    if (Object.keys(style).length > 0) {
+      newStyles.set(key, style)
+    }
   })
   cells.value = newCells
+  cellStyles.value = newStyles
   forceUpdate.value++
 }
 
@@ -249,6 +316,81 @@ const setCellValue = (row: number, col: number, value: string) => {
     }
     cellMap.set('value', value)
   })
+}
+
+const setCellStyle = (row: number, col: number, styleKey: string, value: any) => {
+  const key = getCellKey(row, col)
+
+  ydoc.transact(() => {
+    let cellMap = ycells.get(key)
+    if (!cellMap) {
+      cellMap = new Y.Map<string>()
+      ycells.set(key, cellMap)
+    }
+    if (value) {
+      cellMap.set(styleKey, String(value))
+    } else {
+      cellMap.delete(styleKey)
+    }
+  })
+}
+
+const applyStyle = (styleKey: string, value: any) => {
+  if (!selectionRange.value) return
+
+  const { startRow, endRow, startCol, endCol } = selectionRange.value
+
+  ydoc.transact(() => {
+    for (let r = startRow; r <= endRow; r++) {
+      for (let c = startCol; c <= endCol; c++) {
+        setCellStyle(r, c, styleKey, value)
+      }
+    }
+  })
+}
+
+const handleFontSizeChange = (e: Event) => {
+  const select = e.target as HTMLSelectElement
+  const value = Number(select.value)
+  setTimeout(() => {
+    applyStyle('fontSize', value)
+    nextTick(() => {
+      fontSizeSelect.value?.focus()
+    })
+  }, 10)
+}
+
+const toggleFontSizeDropdown = () => {
+  fontSizeDropdownOpen.value = !fontSizeDropdownOpen.value
+}
+
+const selectFontSize = (size: number) => {
+  applyStyle('fontSize', size)
+  fontSizeDropdownOpen.value = false
+}
+
+const applyStyleLater = (styleKey: string, value: any) => {
+  setTimeout(() => {
+    applyStyle(styleKey, value)
+  }, 0)
+}
+
+const getCurrentCellStyle = (): CellStyle => {
+  if (!selectedCell.value) return {}
+  const key = getCellKey(selectedCell.value.row, selectedCell.value.col)
+  return cellStyles.value.get(key) || {}
+}
+
+const toggleBold = () => {
+  const current = getCurrentCellStyle()
+  const newValue = current.fontWeight === 'bold' ? '' : 'bold'
+  applyStyle('fontWeight', newValue)
+}
+
+const toggleUnderline = () => {
+  const current = getCurrentCellStyle()
+  const newValue = current.textDecoration === 'underline' ? '' : 'underline'
+  applyStyle('textDecoration', newValue)
 }
 
 const selectCell = (row: number, col: number) => {
@@ -316,6 +458,7 @@ const handleContextMenu = (e: MouseEvent, row: number, col: number) => {
 
 const hideContextMenu = () => {
   contextMenu.value.visible = false
+  fontSizeDropdownOpen.value = false
 }
 
 const handleContextAction = (action: string) => {
@@ -503,6 +646,14 @@ const handleInputProxyKeyDown = (e: KeyboardEvent) => {
         e.preventDefault()
         selectAll()
         return
+      case 'b':
+        e.preventDefault()
+        toggleBold()
+        return
+      case 'u':
+        e.preventDefault()
+        toggleUnderline()
+        return
     }
   }
 
@@ -613,6 +764,17 @@ const getCellClass = (row: number, col: number) => {
 
 const getCellStyle = (row: number, col: number) => {
   const style: Record<string, string> = {}
+  const key = getCellKey(row, col)
+  const cellStyle = cellStyles.value.get(key)
+
+  if (cellStyle) {
+    if (cellStyle.color) style.color = cellStyle.color
+    if (cellStyle.bgColor) style.backgroundColor = cellStyle.bgColor
+    if (cellStyle.fontSize) style.fontSize = cellStyle.fontSize + 'px'
+    if (cellStyle.fontWeight) style.fontWeight = cellStyle.fontWeight
+    if (cellStyle.textDecoration) style.textDecoration = cellStyle.textDecoration
+    if (cellStyle.textAlign) style.textAlign = cellStyle.textAlign
+  }
 
   for (const [clientId, cursor] of otherCursors) {
     if (cursor.row === row && cursor.col === col) {
@@ -748,6 +910,118 @@ onUnmounted(() => {
           <path fill="currentColor" d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
         </svg>
         <span>清除</span>
+      </button>
+      <div class="toolbar-divider"></div>
+      <!-- 粗体 -->
+      <button
+        class="toolbar-btn"
+        :class="{ active: getCurrentCellStyle().fontWeight === 'bold' }"
+        @click="toggleBold"
+        title="粗体 (Ctrl+B)"
+      >
+        <svg viewBox="0 0 24 24" width="18" height="18">
+          <path fill="currentColor" d="M15.6 10.79c.97-.67 1.65-1.77 1.65-2.79 0-2.26-1.75-4-4-4H7v14h7.04c2.09 0 3.71-1.7 3.71-3.79 0-1.52-.86-2.82-2.15-3.42zM10 6.5h3c.83 0 1.5.67 1.5 1.5s-.67 1.5-1.5 1.5h-3v-3zm3.5 9H10v-3h3.5c.83 0 1.5.67 1.5 1.5s-.67 1.5-1.5 1.5z"/>
+        </svg>
+      </button>
+      <!-- 下划线 -->
+      <button
+        class="toolbar-btn"
+        :class="{ active: getCurrentCellStyle().textDecoration === 'underline' }"
+        @click="toggleUnderline"
+        title="下划线 (Ctrl+U)"
+      >
+        <svg viewBox="0 0 24 24" width="18" height="18">
+          <path fill="currentColor" d="M12 17c3.31 0 6-2.69 6-6V3h-2.5v8c0 1.93-1.57 3.5-3.5 3.5S8.5 12.93 8.5 11V3H6v8c0 3.31 2.69 6 6 6zm-7 2v2h14v-2H5z"/>
+        </svg>
+      </button>
+      <div class="toolbar-divider"></div>
+      <!-- 文字颜色 -->
+      <div class="color-picker-wrapper">
+        <button class="toolbar-btn color-btn" title="文字颜色">
+          <svg viewBox="0 0 24 24" width="18" height="18">
+            <path fill="currentColor" d="M11 2L5.5 16h2.25l1.12-3h6.25l1.13 3h2.25L13 2h-2zm-1.38 9L12 4.67 14.38 11H9.62z"/>
+          </svg>
+          <span class="color-indicator" :style="{ backgroundColor: getCurrentCellStyle().color || '#333' }"></span>
+        </button>
+        <input
+          type="color"
+          class="color-input"
+          :value="getCurrentCellStyle().color || '#333333'"
+          @input="handleColorInput('color', ($event.target as HTMLInputElement).value)"
+          @change="handleColorChange('color', ($event.target as HTMLInputElement).value)"
+        />
+      </div>
+      <!-- 背景颜色 -->
+      <div class="color-picker-wrapper">
+        <button class="toolbar-btn color-btn" title="背景颜色">
+          <svg viewBox="0 0 24 24" width="18" height="18">
+            <path fill="currentColor" d="M16.56 8.94L7.62 0 6.21 1.41l2.38 2.38-5.15 5.15c-.59.59-.59 1.54 0 2.12l5.5 5.5c.29.29.68.44 1.06.44s.77-.15 1.06-.44l5.5-5.5c.59-.58.59-1.53 0-2.12zM5.21 10L10 5.21 14.79 10H5.21zM19 11.5s-2 2.17-2 3.5c0 1.1.9 2 2 2s2-.9 2-2c0-1.33-2-3.5-2-3.5z"/>
+          </svg>
+          <span class="color-indicator" :style="{ backgroundColor: getCurrentCellStyle().bgColor || '#fff' }"></span>
+        </button>
+        <input
+          type="color"
+          class="color-input"
+          :value="getCurrentCellStyle().bgColor || '#ffffff'"
+          @input="handleColorInput('bgColor', ($event.target as HTMLInputElement).value)"
+          @change="handleColorChange('bgColor', ($event.target as HTMLInputElement).value)"
+        />
+      </div>
+      <div class="toolbar-divider"></div>
+      <!-- 字号 -->
+      <div class="font-size-dropdown">
+        <button
+          class="toolbar-btn font-size-btn"
+          @click.stop="toggleFontSizeDropdown"
+        >
+          <span>{{ getCurrentCellStyle().fontSize || defaultFontSize }}</span>
+          <svg viewBox="0 0 24 24" width="14" height="14">
+            <path fill="currentColor" d="M7 10l5 5 5-5z"/>
+          </svg>
+        </button>
+        <div v-if="fontSizeDropdownOpen" class="font-size-menu">
+          <div
+            v-for="size in fontSizes"
+            :key="size"
+            class="font-size-option"
+            :class="{ active: getCurrentCellStyle().fontSize === size || (!getCurrentCellStyle().fontSize && size === defaultFontSize) }"
+            @click.stop="selectFontSize(size)"
+          >
+            {{ size }}
+          </div>
+        </div>
+      </div>
+      <div class="toolbar-divider"></div>
+      <!-- 对齐 -->
+      <button
+        class="toolbar-btn"
+        :class="{ active: getCurrentCellStyle().textAlign === 'left' }"
+        @click="applyStyle('textAlign', 'left')"
+        title="左对齐"
+      >
+        <svg viewBox="0 0 24 24" width="18" height="18">
+          <path fill="currentColor" d="M15 15H3v2h12v-2zm0-8H3v2h12V7zM3 13h18v-2H3v2zm0 8h18v-2H3v2zM3 3v2h18V3H3z"/>
+        </svg>
+      </button>
+      <button
+        class="toolbar-btn"
+        :class="{ active: getCurrentCellStyle().textAlign === 'center' || !getCurrentCellStyle().textAlign }"
+        @click="applyStyle('textAlign', 'center')"
+        title="居中"
+      >
+        <svg viewBox="0 0 24 24" width="18" height="18">
+          <path fill="currentColor" d="M7 15v2h10v-2H7zm-4 6h18v-2H3v2zm0-8h18v-2H3v2zm4-6v2h10V7H7zM3 3v2h18V3H3z"/>
+        </svg>
+      </button>
+      <button
+        class="toolbar-btn"
+        :class="{ active: getCurrentCellStyle().textAlign === 'right' }"
+        @click="applyStyle('textAlign', 'right')"
+        title="右对齐"
+      >
+        <svg viewBox="0 0 24 24" width="18" height="18">
+          <path fill="currentColor" d="M3 21h18v-2H3v2zm6-4h12v-2H9v2zm-6-4h18v-2H3v2zm6-4h12V7H9v2zM3 3v2h18V3H3z"/>
+        </svg>
       </button>
     </div>
     <div class="spreadsheet" tabindex="0" @click="focusInputProxy" @focus="focusInputProxy">
@@ -906,6 +1180,81 @@ onUnmounted(() => {
   margin: 0 8px;
 }
 
+.toolbar-btn.active {
+  background: #e8f0fe;
+  border-color: var(--primary-color);
+  color: var(--primary-color);
+}
+
+.color-picker-wrapper {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.color-btn {
+  position: relative;
+  padding: 6px 8px;
+}
+
+.color-indicator {
+  position: absolute;
+  bottom: 2px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 14px;
+  height: 3px;
+  border-radius: 1px;
+  border: 1px solid #ccc;
+}
+
+.color-input {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.font-size-dropdown {
+  position: relative;
+}
+
+.font-size-btn {
+  min-width: 50px;
+  justify-content: space-between;
+}
+
+.font-size-menu {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  margin-top: 4px;
+  background: white;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  z-index: 100;
+  min-width: 60px;
+}
+
+.font-size-option {
+  padding: 8px 12px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.font-size-option:hover {
+  background: #f0f0f0;
+}
+
+.font-size-option.active {
+  background: #e8f0fe;
+  color: var(--primary-color);
+}
+
 .spreadsheet {
   flex: 1;
   overflow: hidden;
@@ -1010,6 +1359,7 @@ onUnmounted(() => {
   text-overflow: ellipsis;
   white-space: nowrap;
   line-height: var(--cell-height);
+  height: 100%;
 }
 
 .cell-input {
