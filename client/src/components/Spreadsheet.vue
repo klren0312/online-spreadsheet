@@ -11,6 +11,7 @@ interface CellStyle {
   textDecoration?: string
   textAlign?: string
   image?: string  // base64 图片数据
+  dropdown?: string  // 下拉配置 key
 }
 
 const props = defineProps<{
@@ -34,6 +35,7 @@ const ycells = ydoc.getMap<Y.Map<string>>('cells')
 const ymerges = ydoc.getArray<string>('merges')
 const ycolWidths = ydoc.getMap<number>('colWidths')
 const yrowHeights = ydoc.getMap<number>('rowHeights')
+const ydropdowns = ydoc.getMap<string>('dropdowns')  // 下拉配置
 let provider: WebsocketProvider | null = null
 
 const cells = ref(new Map<string, string>())
@@ -42,6 +44,7 @@ const forceUpdate = ref(0)
 const merges = reactive<Array<{ startRow: number; startCol: number; endRow: number; endCol: number }>>([])
 const colWidths = ref(new Map<number, number>())
 const rowHeights = ref(new Map<number, number>())
+const dropdowns = ref(new Map<string, string[]>())  // key: "row,col" or "row" for row, "col" for column
 
 const fontSizes = [10, 12, 14, 16, 18, 20, 24, 28, 32]
 const defaultFontSize = 14
@@ -450,6 +453,7 @@ const syncCellsFromYjs = () => {
     const textDecoration = cellMap.get('textDecoration')
     const textAlign = cellMap.get('textAlign')
     const image = cellMap.get('image')
+    const dropdown = cellMap.get('dropdown')
 
     if (color) style.color = color
     if (bgColor) style.bgColor = bgColor
@@ -458,6 +462,7 @@ const syncCellsFromYjs = () => {
     if (textDecoration) style.textDecoration = textDecoration
     if (textAlign) style.textAlign = textAlign
     if (image) style.image = image
+    if (dropdown) style.dropdown = dropdown
 
     if (Object.keys(style).length > 0) {
       newStyles.set(key, style)
@@ -491,6 +496,19 @@ const syncDimensionsFromYjs = () => {
 
   colWidths.value = newColWidths
   rowHeights.value = newRowHeights
+}
+
+const syncDropdownsFromYjs = () => {
+  const newDropdowns = new Map<string, string[]>()
+  ydropdowns.forEach((optionsJson, key) => {
+    try {
+      const options = JSON.parse(optionsJson)
+      newDropdowns.set(key, options)
+    } catch (e) {
+      console.error('Failed to parse dropdown options:', e)
+    }
+  })
+  dropdowns.value = newDropdowns
 }
 
 const getColWidth = (col: number): number => {
@@ -622,6 +640,22 @@ const selectCell = (row: number, col: number) => {
   }
 }
 
+const selectRow = (row: number) => {
+  selectCell(row, 0)
+  selectionStart.value = { row, col: 0 }
+  selectionEnd.value = { row, col: COLS - 1 }
+}
+
+const selectCol = (col: number) => {
+  selectionStart.value = { row: 1, col }
+  selectionEnd.value = { row: ROWS, col }
+  selectedCell.value = { row: 1, col }
+
+  if (provider) {
+    provider.awareness.setLocalStateField('cursor', { row: 1, col })
+  }
+}
+
 const handleMouseDown = (row: number, col: number, e: MouseEvent) => {
   if (e.button === 2) return
 
@@ -658,6 +692,139 @@ const handleMouseUp = () => {
 }
 
 const previewImage = ref<string | null>(null)
+
+// 下拉配置弹窗
+const showDropdownConfig = ref(false)
+const dropdownConfigType = ref<'row' | 'col'>('row')
+const dropdownConfigIndex = ref(0)
+const dropdownOptions = ref('')
+
+// 判断是否选中了整行或整列
+const isEntireRowSelected = computed(() => {
+  if (!selectionRange.value) return false
+  return selectionRange.value.startCol === 0 &&
+         selectionRange.value.endCol === COLS - 1 &&
+         selectionRange.value.startRow === selectionRange.value.endRow
+})
+
+const isEntireColSelected = computed(() => {
+  if (!selectionRange.value) return false
+  return selectionRange.value.startRow === 1 &&
+         selectionRange.value.endRow === ROWS &&
+         selectionRange.value.startCol === selectionRange.value.endCol
+})
+
+const getSelectedRow = computed(() => {
+  if (!selectionRange.value || !isEntireRowSelected.value) return null
+  return selectionRange.value.startRow
+})
+
+const getSelectedCol = computed(() => {
+  if (!selectionRange.value || !isEntireColSelected.value) return null
+  return selectionRange.value.startCol
+})
+
+const canAddDropdown = computed(() => {
+  return isEntireRowSelected.value || isEntireColSelected.value
+})
+
+const handleDropdownConfig = () => {
+  if (!selectionRange.value) return
+
+  // 判断是行还是列
+  const startRow = selectionRange.value.startRow
+  const endRow = selectionRange.value.endRow
+  const startCol = selectionRange.value.startCol
+  const endCol = selectionRange.value.endCol
+
+  // 整行：起始列为0，结束列为COLS-1
+  if (startCol === 0 && endCol === COLS - 1) {
+    openDropdownConfig('row', startRow)
+  }
+  // 整列：起始行为1，结束行为ROWS
+  else if (startRow === 1 && endRow === ROWS) {
+    openDropdownConfig('col', startCol)
+  }
+}
+
+const dropdownTextarea = ref<HTMLTextAreaElement | null>(null)
+
+const openDropdownConfig = (type: 'row' | 'col', index: number) => {
+  dropdownConfigType.value = type
+  dropdownConfigIndex.value = index
+
+  // 获取已有的配置
+  const key = type === 'row' ? `row-${index}` : `col-${index}`
+  const existingOptions = dropdowns.value.get(key) || []
+  dropdownOptions.value = existingOptions.join('\n')
+
+  showDropdownConfig.value = true
+
+  // 聚焦输入框
+  nextTick(() => {
+    dropdownTextarea.value?.focus()
+  })
+}
+
+const saveDropdownConfig = () => {
+  const options = dropdownOptions.value
+    .split('\n')
+    .map(o => o.trim())
+    .filter(o => o.length > 0)
+
+  if (options.length === 0) {
+    showDropdownConfig.value = false
+    return
+  }
+
+  const key = dropdownConfigType.value === 'row'
+    ? `row-${dropdownConfigIndex.value}`
+    : `col-${dropdownConfigIndex.value}`
+
+  ydoc.transact(() => {
+    ydropdowns.set(key, JSON.stringify(options))
+  })
+
+  // 对该行/列的所有单元格应用下拉
+  ydoc.transact(() => {
+    if (dropdownConfigType.value === 'row') {
+      for (let c = 0; c < COLS; c++) {
+        setCellStyle(dropdownConfigIndex.value, c, 'dropdown', key)
+      }
+    } else {
+      for (let r = 1; r <= ROWS; r++) {
+        setCellStyle(r, dropdownConfigIndex.value, 'dropdown', key)
+      }
+    }
+  })
+
+  showDropdownConfig.value = false
+}
+
+const cancelDropdownConfig = () => {
+  showDropdownConfig.value = false
+}
+
+const getCellDropdownOptions = (row: number, col: number): string[] | null => {
+  const key = getCellKey(row, col)
+  const style = cellStyles.value.get(key)
+  if (style?.dropdown) {
+    return dropdowns.value.get(style.dropdown) || null
+  }
+
+  // 检查行/列级别
+  const rowKey = `row-${row}`
+  if (dropdowns.value.has(rowKey)) {
+    return dropdowns.value.get(rowKey) || null
+  }
+
+  const colKey = `col-${col}`
+  if (dropdowns.value.has(colKey)) {
+    return dropdowns.value.get(colKey) || null
+  }
+
+  return null
+}
 
 const handleCellDblClick = (row: number, col: number) => {
   const key = getCellKey(row, col)
@@ -1089,9 +1256,11 @@ onMounted(() => {
   ymerges.observeDeep(syncMergesFromYjs)
   ycolWidths.observeDeep(syncDimensionsFromYjs)
   yrowHeights.observeDeep(syncDimensionsFromYjs)
+  ydropdowns.observeDeep(syncDropdownsFromYjs)
   syncCellsFromYjs()
   syncMergesFromYjs()
   syncDimensionsFromYjs()
+  syncDropdownsFromYjs()
 
   focusInputProxy()
   document.addEventListener('mouseup', handleMouseUp)
@@ -1306,6 +1475,19 @@ onUnmounted(() => {
           <path fill="currentColor" d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
         </svg>
       </button>
+      <div class="toolbar-divider"></div>
+      <button
+        class="toolbar-btn"
+        :class="{ disabled: !canAddDropdown }"
+        :disabled="!canAddDropdown"
+        @click="handleDropdownConfig"
+        title="配置下拉"
+      >
+        <svg viewBox="0 0 24 24" width="18" height="18">
+          <path fill="currentColor" d="M3 17v2h6v-2H3zM3 5v2h10V5H3zm10 16v-2h8v-2h-8v-2h-2v6h2zM7 9v2H3v2h4v2h2V9H7zm14 4v-2H11v2h10zm-6-4h2V7h4V5h-4V3h-2v6z"/>
+        </svg>
+        <span>下拉</span>
+      </button>
     </div>
     <input
       ref="imageInput"
@@ -1321,15 +1503,16 @@ onUnmounted(() => {
             <tr>
               <th class="corner-cell"></th>
               <th
-                v-for="(col, index) in colLetters"
-                :key="col"
+                v-for="i in COLS"
+                :key="i"
                 class="col-header"
-                :style="{ width: getColWidth(index) + 'px', minWidth: getColWidth(index) + 'px' }"
+                :style="{ width: getColWidth(i - 1) + 'px', minWidth: getColWidth(i - 1) + 'px' }"
+                @mousedown.stop="selectCol(i - 1)"
               >
-                {{ col }}
+                {{ colLetters[i - 1] }}
                 <div
                   class="col-resize-handle"
-                  @mousedown="handleColResizeStart($event, index)"
+                  @mousedown.stop="handleColResizeStart($event, i - 1)"
                 ></div>
               </th>
             </tr>
@@ -1339,34 +1522,35 @@ onUnmounted(() => {
               <td
                 class="row-header"
                 :style="{ height: getRowHeight(row) + 'px', minHeight: getRowHeight(row) + 'px' }"
+                @mousedown.stop="selectRow(row)"
               >
                 {{ row }}
                 <div
                   class="row-resize-handle"
-                  @mousedown="handleRowResizeStart($event, row)"
+                  @mousedown.stop="handleRowResizeStart($event, row)"
                 ></div>
               </td>
               <template v-for="colIdx in COLS" :key="`${row}-${colIdx}`">
                 <td
-                  v-if="!shouldHideCell(row, colIdx)"
-                  :class="getCellClass(row, colIdx)"
-                  :style="getCellStyle(row, colIdx)"
-                  :rowspan="getRowspan(row, colIdx) || undefined"
-                  :colspan="getColspan(row, colIdx) || undefined"
-                  @mousedown="handleMouseDown(row, colIdx, $event)"
-                  @mousemove="handleMouseMove(row, colIdx)"
-                  @dblclick="handleCellDblClick(row, colIdx)"
-                  @contextmenu="handleContextMenu($event, row, colIdx)"
+                  v-if="!shouldHideCell(row, colIdx - 1)"
+                  :class="getCellClass(row, colIdx - 1)"
+                  :style="getCellStyle(row, colIdx - 1)"
+                  :rowspan="getRowspan(row, colIdx - 1) || undefined"
+                  :colspan="getColspan(row, colIdx - 1) || undefined"
+                  @mousedown="handleMouseDown(row, colIdx - 1, $event)"
+                  @mousemove="handleMouseMove(row, colIdx - 1)"
+                  @dblclick="handleCellDblClick(row, colIdx - 1)"
+                  @contextmenu="handleContextMenu($event, row, colIdx - 1)"
                 >
                   <div
-                    v-if="getCursorLabel(row, colIdx)"
+                    v-if="getCursorLabel(row, colIdx - 1)"
                     class="cursor-label"
-                    :style="{ backgroundColor: getCursorLabel(row, colIdx)?.color }"
+                    :style="{ backgroundColor: getCursorLabel(row, colIdx - 1)?.color }"
                   >
-                    {{ getCursorLabel(row, colIdx)?.name }}
+                    {{ getCursorLabel(row, colIdx - 1)?.name }}
                   </div>
                   <input
-                    v-if="editingCell?.row === row && editingCell?.col === colIdx"
+                    v-if="editingCell?.row === row && editingCell?.col === colIdx - 1"
                     v-model="editValue"
                     class="cell-input"
                     @keydown="handleEditingKeyDown"
@@ -1375,11 +1559,29 @@ onUnmounted(() => {
                   />
                   <template v-else>
                     <img
-                      v-if="cellStyles.get(getCellKey(row, colIdx))?.image"
-                      :src="cellStyles.get(getCellKey(row, colIdx))?.image"
+                      v-if="cellStyles.get(getCellKey(row, colIdx - 1))?.image"
+                      :src="cellStyles.get(getCellKey(row, colIdx - 1))?.image"
                       class="cell-image"
                     />
-                    <span v-else class="cell-value">{{ getCellValue(row, colIdx) }}</span>
+                    <select
+                      v-else-if="getCellDropdownOptions(row, colIdx - 1)"
+                      class="cell-dropdown"
+                      :value="getCellValue(row, colIdx - 1)"
+                      @change="setCellValue(row, colIdx - 1, ($event.target as HTMLSelectElement).value)"
+                      @mousedown.stop
+                      @mouseup.stop
+                      @click.stop
+                    >
+                      <option value="">请选择</option>
+                      <option
+                        v-for="option in getCellDropdownOptions(row, colIdx - 1)"
+                        :key="option"
+                        :value="option"
+                      >
+                        {{ option }}
+                      </option>
+                    </select>
+                    <span v-else class="cell-value">{{ getCellValue(row, colIdx - 1) }}</span>
                   </template>
                 </td>
               </template>
@@ -1429,14 +1631,51 @@ onUnmounted(() => {
       v-if="previewImage"
       class="image-preview-overlay"
       @click="closePreview"
+      @mousedown.stop
+      @mouseup.stop
     >
-      <div class="image-preview-content" @click.stop>
+      <div class="image-preview-content" @click.stop @mouseup.stop>
         <img :src="previewImage" alt="预览图片" />
-        <button class="preview-close" @click="closePreview">
+        <button class="preview-close" @click.stop="closePreview" @mouseup.stop>
           <svg viewBox="0 0 24 24" width="24" height="24">
             <path fill="currentColor" d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
           </svg>
         </button>
+      </div>
+    </div>
+    <!-- 下拉配置弹窗 -->
+    <div
+      v-if="showDropdownConfig"
+      class="dropdown-config-overlay"
+      @click="cancelDropdownConfig"
+      @mousedown.stop
+      @mouseup.stop
+    >
+      <div class="dropdown-config-modal" @click.stop @mouseup.stop>
+        <div class="modal-header">
+          <h3>配置下拉选项 - {{ dropdownConfigType === 'row' ? '第 ' + dropdownConfigIndex + ' 行' : '列 ' + colLetters[dropdownConfigIndex] }}</h3>
+          <button class="modal-close" @click.stop="cancelDropdownConfig" @mouseup.stop>
+            <svg viewBox="0 0 24 24" width="20" height="20">
+              <path fill="currentColor" d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
+            </svg>
+          </button>
+        </div>
+        <div class="modal-body">
+          <p>请输入下拉选项，每行一个选项：</p>
+          <textarea
+            ref="dropdownTextarea"
+            v-model="dropdownOptions"
+            placeholder="选项1&#10;选项2&#10;选项3"
+            rows="8"
+            @mousedown.stop
+            @mouseup.stop
+            @click.stop
+          ></textarea>
+        </div>
+        <div class="modal-footer">
+          <button class="btn-cancel" @click.stop="cancelDropdownConfig" @mouseup.stop>取消</button>
+          <button class="btn-confirm" @click.stop="saveDropdownConfig" @mouseup.stop>确定</button>
+        </div>
       </div>
     </div>
   </div>
@@ -1724,6 +1963,21 @@ onUnmounted(() => {
   object-fit: contain;
 }
 
+.cell-dropdown {
+  width: 100%;
+  height: 100%;
+  border: none;
+  background: transparent;
+  font-size: inherit;
+  font-family: inherit;
+  cursor: pointer;
+  padding: 0 2px;
+}
+
+.cell-dropdown:focus {
+  outline: none;
+}
+
 .cell-input {
   width: 100%;
   height: 100%;
@@ -1830,5 +2084,114 @@ onUnmounted(() => {
 
 .preview-close:hover {
   color: #ccc;
+}
+
+.dropdown-config-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+}
+
+.dropdown-config-modal {
+  background: white;
+  border-radius: 8px;
+  width: 400px;
+  max-width: 90vw;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);
+}
+
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px 20px;
+  border-bottom: 1px solid #e0e0e0;
+}
+
+.modal-header h3 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 500;
+}
+
+.modal-close {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: #666;
+  padding: 4px;
+}
+
+.modal-close:hover {
+  color: #333;
+}
+
+.modal-body {
+  padding: 20px;
+}
+
+.modal-body p {
+  margin: 0 0 12px;
+  color: #666;
+  font-size: 14px;
+}
+
+.modal-body textarea {
+  width: 100%;
+  padding: 12px;
+  border: 1px solid #e0e0e0;
+  border-radius: 4px;
+  font-size: 14px;
+  resize: vertical;
+  font-family: inherit;
+  box-sizing: border-box;
+}
+
+.modal-body textarea:focus {
+  outline: none;
+  border-color: var(--primary-color);
+}
+
+.modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  padding: 16px 20px;
+  border-top: 1px solid #e0e0e0;
+}
+
+.btn-cancel,
+.btn-confirm {
+  padding: 8px 20px;
+  border-radius: 4px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.btn-cancel {
+  background: white;
+  border: 1px solid #e0e0e0;
+  color: #666;
+}
+
+.btn-cancel:hover {
+  background: #f5f5f5;
+}
+
+.btn-confirm {
+  background: var(--primary-color);
+  border: 1px solid var(--primary-color);
+  color: white;
+}
+
+.btn-confirm:hover {
+  background: #1976d2;
 }
 </style>
