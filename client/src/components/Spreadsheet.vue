@@ -2,6 +2,8 @@
 import { ref, reactive, onMounted, onUnmounted, nextTick, computed } from 'vue'
 import * as Y from 'yjs'
 import { WebsocketProvider } from 'y-websocket'
+import * as XLSX from 'xlsx-js-style'
+import ExcelJS from 'exceljs'
 
 interface CellStyle {
   color?: string
@@ -22,13 +24,35 @@ const emit = defineEmits<{
   statusChange: [status: { connected: boolean; collaborators: any[] }]
 }>()
 
-const ROWS = 100
-const COLS = 26
+const ROWS = 1000  // 支持更多行
+const COLS = 52   // 支持更多列 (A-Z, AA-AZ)
 
 const DEFAULT_COL_WIDTH = 100
 const DEFAULT_ROW_HEIGHT = 28
 
-const colLetters = Array.from({ length: COLS }, (_, i) => String.fromCharCode(65 + i))
+// 虚拟滚动配置
+const BUFFER_ROWS = 5  // 上下缓冲行数
+const BUFFER_COLS = 2  // 左右缓冲列数
+const visibleStartRow = ref(1)
+const visibleEndRow = ref(50)
+const visibleStartCol = ref(0)
+const visibleEndCol = ref(26)
+const spreadsheetContainer = ref<HTMLElement | null>(null)
+
+// 生成列字母 A-Z, AA-AZ, BA-BZ, ...
+const colLetters = (() => {
+  const letters: string[] = []
+  for (let i = 0; i < COLS; i++) {
+    if (i < 26) {
+      letters.push(String.fromCharCode(65 + i))
+    } else {
+      const first = Math.floor((i - 26) / 26)
+      const second = (i - 26) % 26
+      letters.push(String.fromCharCode(65 + first) + String.fromCharCode(65 + second))
+    }
+  }
+  return letters
+})()
 
 const ydoc = new Y.Doc()
 const ycells = ydoc.getMap<Y.Map<string>>('cells')
@@ -109,6 +133,131 @@ const resizingRow = ref<number | null>(null)
 const resizingStartY = ref(0)
 const resizingStartHeight = ref(0)
 
+// 虚拟滚动：计算可见区域
+const updateVisibleRange = () => {
+  const container = spreadsheetContainer.value
+  if (!container) return
+
+  const scrollTop = container.scrollTop
+  const scrollLeft = container.scrollLeft
+  const clientHeight = container.clientHeight
+  const clientWidth = container.clientWidth
+
+  // 计算可见行范围
+  let rowHeightSum = 0
+  let startRow = 1
+  for (let r = 1; r <= ROWS; r++) {
+    rowHeightSum += getRowHeight(r)
+    if (rowHeightSum > scrollTop) {
+      startRow = r
+      break
+    }
+  }
+
+  let endRow = startRow
+  rowHeightSum = 0
+  for (let r = startRow; r <= ROWS; r++) {
+    rowHeightSum += getRowHeight(r)
+    if (rowHeightSum > clientHeight + scrollTop) {
+      endRow = r
+      break
+    }
+    endRow = r
+  }
+
+  // 计算可见列范围
+  let colWidthSum = 50 // 行头宽度
+  let startCol = 0
+  for (let c = 0; c < COLS; c++) {
+    colWidthSum += getColWidth(c)
+    if (colWidthSum > scrollLeft) {
+      startCol = c
+      break
+    }
+  }
+
+  let endCol = startCol
+  colWidthSum = 50
+  for (let c = 0; c < COLS; c++) {
+    colWidthSum += getColWidth(c)
+    if (colWidthSum > clientWidth + scrollLeft) {
+      endCol = c
+      break
+    }
+    endCol = c
+  }
+
+  // 添加缓冲区
+  visibleStartRow.value = Math.max(1, startRow - BUFFER_ROWS)
+  visibleEndRow.value = Math.min(ROWS, endRow + BUFFER_ROWS)
+  visibleStartCol.value = Math.max(0, startCol - BUFFER_COLS)
+  visibleEndCol.value = Math.min(COLS - 1, endCol + BUFFER_COLS)
+}
+
+// 计算表格总高度
+const getTotalHeight = computed(() => {
+  let height = 0
+  for (let r = 1; r <= ROWS; r++) {
+    height += getRowHeight(r)
+  }
+  return height
+})
+
+// 计算表格总宽度
+const getTotalWidth = computed(() => {
+  let width = 50 // 行头宽度
+  for (let c = 0; c < COLS; c++) {
+    width += getColWidth(c)
+  }
+  return width
+})
+
+// 计算上方占位高度
+const getTopPadding = computed(() => {
+  let height = 0
+  for (let r = 1; r < visibleStartRow.value; r++) {
+    height += getRowHeight(r)
+  }
+  return height
+})
+
+// 计算左侧占位宽度
+const getLeftPadding = computed(() => {
+  let width = 0
+  for (let c = 0; c < visibleStartCol.value; c++) {
+    width += getColWidth(c)
+  }
+  return width
+})
+
+// 获取可见行范围
+const visibleRows = computed(() => {
+  const rows: number[] = []
+  for (let r = visibleStartRow.value; r <= visibleEndRow.value; r++) {
+    rows.push(r)
+  }
+  return rows
+})
+
+// 获取可见列范围
+const visibleCols = computed(() => {
+  const cols: number[] = []
+  for (let c = visibleStartCol.value; c <= visibleEndCol.value; c++) {
+    cols.push(c)
+  }
+  return cols
+})
+
+// 节流的滚动处理
+let scrollThrottleTimer: ReturnType<typeof setTimeout> | null = null
+const handleScroll = () => {
+  if (scrollThrottleTimer) return
+  scrollThrottleTimer = setTimeout(() => {
+    scrollThrottleTimer = null
+    updateVisibleRange()
+  }, 16) // 约 60fps
+}
+
 const handleColResizeStart = (e: MouseEvent, col: number) => {
   e.preventDefault()
   e.stopPropagation()
@@ -161,6 +310,7 @@ const handleRowResizeEnd = () => {
 
 // 图片处理
 const imageInput = ref<HTMLInputElement | null>(null)
+const excelInput = ref<HTMLInputElement | null>(null)
 
 const handleImageUpload = (e: Event) => {
   const input = e.target as HTMLInputElement
@@ -184,6 +334,203 @@ const handleImageUpload = (e: Event) => {
 const openImageUpload = () => {
   if (!selectedCell.value) return
   imageInput.value?.click()
+}
+
+// 导入 Excel
+const triggerImportExcel = () => {
+  excelInput.value?.click()
+}
+
+const handleImportExcel = (e: Event) => {
+  const input = e.target as HTMLInputElement
+  if (!input.files || input.files.length === 0) return
+
+  const file = input.files[0]
+  const reader = new FileReader()
+
+  reader.onload = (event) => {
+    try {
+      const data = event.target?.result
+      const workbook = XLSX.read(data, { type: 'binary' })
+
+      // 读取第一个工作表
+      const sheetName = workbook.SheetNames[0]
+      const sheet = workbook.Sheets[sheetName]
+
+      // 转换为二维数组
+      const jsonData = XLSX.utils.sheet_to_json(sheet, { header: 1 }) as string[][]
+
+      // 填充到表格中
+      ydoc.transact(() => {
+        for (let r = 0; r < jsonData.length && r < ROWS; r++) {
+          const row = jsonData[r]
+          if (!Array.isArray(row)) continue
+
+          for (let c = 0; c < row.length && c < COLS; c++) {
+            const value = row[c]
+            if (value !== undefined && value !== null) {
+              setCellValue(r + 1, c, String(value))
+            }
+          }
+        }
+      })
+    } catch (err) {
+      console.error('导入 Excel 失败:', err)
+      alert('导入 Excel 失败，请检查文件格式')
+    }
+  }
+
+  reader.readAsBinaryString(file)
+
+  // 清空 input 以便重复选择同一文件
+  input.value = ''
+}
+
+// 导出 Excel
+// 将列索引转换为 Excel 列名 (0->A, 1->B, ...)
+const colToExcelName = (col: number): string => {
+  let name = ''
+  let c = col
+  while (c >= 0) {
+    name = String.fromCharCode(65 + (c % 26)) + name
+    c = Math.floor(c / 26) - 1
+  }
+  return name
+}
+
+// 将 (row, col) 转换为 Excel 单元格地址
+const cellAddress = (row: number, col: number): string => {
+  return colToExcelName(col) + row
+}
+
+const exportExcel = async () => {
+  // 找出有数据的范围
+  let maxRow = 0
+  let maxCol = 0
+
+  for (let r = 1; r <= ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const value = getCellValue(r, c)
+      const style = cellStyles.value.get(getCellKey(r, c))
+      if (value || style?.image) {
+        maxRow = Math.max(maxRow, r)
+        maxCol = Math.max(maxCol, c)
+      }
+    }
+  }
+
+  // 如果没有数据，提示用户
+  if (maxRow === 0) {
+    alert('表格中没有数据可导出')
+    return
+  }
+
+  // 使用 ExcelJS 创建工作簿
+  const workbook = new ExcelJS.Workbook()
+  const worksheet = workbook.addWorksheet('Sheet1')
+
+  // 设置列宽
+  for (let c = 0; c <= maxCol; c++) {
+    worksheet.getColumn(c + 1).width = Math.max(10, Math.floor(getColWidth(c) / 8))
+  }
+
+  // 添加数据和样式
+  for (let r = 1; r <= maxRow; r++) {
+    const row = worksheet.getRow(r)
+    row.height = getRowHeight(r) * 0.75
+
+    for (let c = 0; c <= maxCol; c++) {
+      const cell = row.getCell(c + 1)
+      cell.value = getCellValue(r, c)
+
+      const style = cellStyles.value.get(getCellKey(r, c))
+      if (style) {
+        // 字体样式
+        cell.font = {
+          bold: style.fontWeight === 'bold',
+          underline: style.textDecoration === 'underline' ? 'single' : undefined,
+          color: style.color ? { argb: 'FF' + style.color.replace('#', '') } : undefined,
+          size: style.fontSize || 11
+        }
+
+        // 背景颜色
+        if (style.bgColor) {
+          cell.fill = {
+            type: 'pattern',
+            pattern: 'solid',
+            fgColor: { argb: 'FF' + style.bgColor.replace('#', '') }
+          }
+        }
+
+        // 对齐
+        if (style.textAlign) {
+          cell.alignment = {
+            horizontal: style.textAlign as 'left' | 'center' | 'right'
+          }
+        }
+      }
+    }
+  }
+
+  // 合并单元格
+  for (const merge of merges) {
+    if (merge.startRow <= maxRow && merge.startCol <= maxCol) {
+      worksheet.mergeCells(
+        merge.startRow,
+        merge.startCol + 1,
+        Math.min(merge.endRow, maxRow),
+        Math.min(merge.endCol, maxCol) + 1
+      )
+    }
+  }
+
+  // 添加图片
+  for (let r = 1; r <= maxRow; r++) {
+    for (let c = 0; c <= maxCol; c++) {
+      const style = cellStyles.value.get(getCellKey(r, c))
+      if (style?.image) {
+        const imageData = style.image
+        const matches = imageData.match(/^data:image\/(\w+);base64,(.+)$/)
+        if (matches) {
+          const ext = matches[1] as 'png' | 'jpeg' | 'gif' | 'bmp' | 'webp'
+          const base64Data = matches[2]
+
+          // 将 base64 转换为 ArrayBuffer
+          const binaryString = atob(base64Data)
+          const bytes = new Uint8Array(binaryString.length)
+          for (let i = 0; i < binaryString.length; i++) {
+            bytes[i] = binaryString.charCodeAt(i)
+          }
+
+          // 添加图片到工作簿
+          const imageId = workbook.addImage({
+            buffer: bytes.buffer,
+            extension: ext
+          })
+
+          // 添加图片到工作表
+          worksheet.addImage(imageId, {
+            tl: { col: c, row: r - 1 },
+            br: { col: c + 1, row: r },
+            editAs: 'oneCell'
+          })
+        }
+      }
+    }
+  }
+
+  // 导出文件
+  const fileName = `spreadsheet_${new Date().toISOString().slice(0, 10)}.xlsx`
+  const buffer = await workbook.xlsx.writeBuffer()
+
+  // 下载文件
+  const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = fileName
+  link.click()
+  URL.revokeObjectURL(url)
 }
 
 const handleDocumentKeyDown = (e: KeyboardEvent) => {
@@ -637,6 +984,43 @@ const selectCell = (row: number, col: number) => {
 
   if (provider) {
     provider.awareness.setLocalStateField('cursor', { row, col })
+  }
+
+  // 确保选中的单元格在可见区域内
+  scrollToCell(row, col)
+}
+
+// 滚动到指定单元格
+const scrollToCell = (row: number, col: number) => {
+  const container = spreadsheetContainer.value
+  if (!container) return
+
+  // 计算目标位置
+  let targetTop = 0
+  for (let r = 1; r < row; r++) {
+    targetTop += getRowHeight(r)
+  }
+
+  let targetLeft = 50 // 行头宽度
+  for (let c = 0; c < col; c++) {
+    targetLeft += getColWidth(c)
+  }
+
+  const cellHeight = getRowHeight(row)
+  const cellWidth = getColWidth(col)
+
+  // 垂直滚动
+  if (targetTop < container.scrollTop) {
+    container.scrollTop = targetTop
+  } else if (targetTop + cellHeight > container.scrollTop + container.clientHeight) {
+    container.scrollTop = targetTop + cellHeight - container.clientHeight
+  }
+
+  // 水平滚动
+  if (targetLeft < container.scrollLeft) {
+    container.scrollLeft = targetLeft
+  } else if (targetLeft + cellWidth > container.scrollLeft + container.clientWidth) {
+    container.scrollLeft = targetLeft + cellWidth - container.clientWidth
   }
 }
 
@@ -1266,12 +1650,28 @@ onMounted(() => {
   document.addEventListener('mouseup', handleMouseUp)
   document.addEventListener('click', hideContextMenu)
   document.addEventListener('keydown', handleDocumentKeyDown)
+
+  // 初始化可见区域
+  nextTick(() => {
+    updateVisibleRange()
+  })
+
+  // 添加滚动监听
+  if (spreadsheetContainer.value) {
+    spreadsheetContainer.value.addEventListener('scroll', handleScroll)
+  }
 })
 
 onUnmounted(() => {
   document.removeEventListener('mouseup', handleMouseUp)
   document.removeEventListener('click', hideContextMenu)
   document.removeEventListener('keydown', handleDocumentKeyDown)
+
+  // 移除滚动监听
+  if (spreadsheetContainer.value) {
+    spreadsheetContainer.value.removeEventListener('scroll', handleScroll)
+  }
+
   if (provider) {
     provider.disconnect()
     provider.destroy()
@@ -1488,6 +1888,27 @@ onUnmounted(() => {
         </svg>
         <span>下拉</span>
       </button>
+      <div class="toolbar-divider"></div>
+      <button
+        class="toolbar-btn"
+        @click="triggerImportExcel"
+        title="导入 Excel"
+      >
+        <svg viewBox="0 0 24 24" width="18" height="18">
+          <path fill="currentColor" d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/>
+        </svg>
+        <span>导入</span>
+      </button>
+      <button
+        class="toolbar-btn"
+        @click="exportExcel"
+        title="导出 Excel"
+      >
+        <svg viewBox="0 0 24 24" width="18" height="18">
+          <path fill="currentColor" d="M19 12v7H5v-7H3v7c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2v-7h-2zm-6 .67l2.59-2.58L17 11.5l-5 5-5-5 1.41-1.41L11 12.67V3h2z"/>
+        </svg>
+        <span>导出</span>
+      </button>
     </div>
     <input
       ref="imageInput"
@@ -1496,29 +1917,44 @@ onUnmounted(() => {
       style="display: none"
       @change="handleImageUpload"
     />
+    <input
+      ref="excelInput"
+      type="file"
+      accept=".xlsx,.xls"
+      style="display: none"
+      @change="handleImportExcel"
+    />
     <div class="spreadsheet" tabindex="0" @click="focusInputProxy" @focus="focusInputProxy">
-      <div class="spreadsheet-container">
+      <div
+        ref="spreadsheetContainer"
+        class="spreadsheet-container"
+      >
         <table class="spreadsheet-table">
           <thead>
             <tr>
               <th class="corner-cell"></th>
               <th
-                v-for="i in COLS"
-                :key="i"
+                v-for="c in visibleCols"
+                :key="c"
                 class="col-header"
-                :style="{ width: getColWidth(i - 1) + 'px', minWidth: getColWidth(i - 1) + 'px' }"
-                @mousedown.stop="selectCol(i - 1)"
+                :style="{ width: getColWidth(c) + 'px', minWidth: getColWidth(c) + 'px' }"
+                @mousedown.stop="selectCol(c)"
               >
-                {{ colLetters[i - 1] }}
+                {{ colLetters[c] }}
                 <div
                   class="col-resize-handle"
-                  @mousedown.stop="handleColResizeStart($event, i - 1)"
+                  @mousedown.stop="handleColResizeStart($event, c)"
                 ></div>
               </th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="row in ROWS" :key="row">
+            <!-- 上方占位 -->
+            <tr v-if="getTopPadding > 0" :style="{ height: getTopPadding + 'px' }">
+              <td :colspan="visibleCols.length + 1" style="padding: 0"></td>
+            </tr>
+            <!-- 可见行 -->
+            <tr v-for="row in visibleRows" :key="row">
               <td
                 class="row-header"
                 :style="{ height: getRowHeight(row) + 'px', minHeight: getRowHeight(row) + 'px' }"
@@ -1530,27 +1966,27 @@ onUnmounted(() => {
                   @mousedown.stop="handleRowResizeStart($event, row)"
                 ></div>
               </td>
-              <template v-for="colIdx in COLS" :key="`${row}-${colIdx}`">
+              <template v-for="col in visibleCols" :key="`${row}-${col}`">
                 <td
-                  v-if="!shouldHideCell(row, colIdx - 1)"
-                  :class="getCellClass(row, colIdx - 1)"
-                  :style="getCellStyle(row, colIdx - 1)"
-                  :rowspan="getRowspan(row, colIdx - 1) || undefined"
-                  :colspan="getColspan(row, colIdx - 1) || undefined"
-                  @mousedown="handleMouseDown(row, colIdx - 1, $event)"
-                  @mousemove="handleMouseMove(row, colIdx - 1)"
-                  @dblclick="handleCellDblClick(row, colIdx - 1)"
-                  @contextmenu="handleContextMenu($event, row, colIdx - 1)"
+                  v-if="!shouldHideCell(row, col)"
+                  :class="getCellClass(row, col)"
+                  :style="getCellStyle(row, col)"
+                  :rowspan="getRowspan(row, col) || undefined"
+                  :colspan="getColspan(row, col) || undefined"
+                  @mousedown="handleMouseDown(row, col, $event)"
+                  @mousemove="handleMouseMove(row, col)"
+                  @dblclick="handleCellDblClick(row, col)"
+                  @contextmenu="handleContextMenu($event, row, col)"
                 >
                   <div
-                    v-if="getCursorLabel(row, colIdx - 1)"
+                    v-if="getCursorLabel(row, col)"
                     class="cursor-label"
-                    :style="{ backgroundColor: getCursorLabel(row, colIdx - 1)?.color }"
+                    :style="{ backgroundColor: getCursorLabel(row, col)?.color }"
                   >
-                    {{ getCursorLabel(row, colIdx - 1)?.name }}
+                    {{ getCursorLabel(row, col)?.name }}
                   </div>
                   <input
-                    v-if="editingCell?.row === row && editingCell?.col === colIdx - 1"
+                    v-if="editingCell?.row === row && editingCell?.col === col"
                     v-model="editValue"
                     class="cell-input"
                     @keydown="handleEditingKeyDown"
@@ -1559,29 +1995,29 @@ onUnmounted(() => {
                   />
                   <template v-else>
                     <img
-                      v-if="cellStyles.get(getCellKey(row, colIdx - 1))?.image"
-                      :src="cellStyles.get(getCellKey(row, colIdx - 1))?.image"
+                      v-if="cellStyles.get(getCellKey(row, col))?.image"
+                      :src="cellStyles.get(getCellKey(row, col))?.image"
                       class="cell-image"
                     />
                     <select
-                      v-else-if="getCellDropdownOptions(row, colIdx - 1)"
+                      v-else-if="getCellDropdownOptions(row, col)"
                       class="cell-dropdown"
-                      :value="getCellValue(row, colIdx - 1)"
-                      @change="setCellValue(row, colIdx - 1, ($event.target as HTMLSelectElement).value)"
+                      :value="getCellValue(row, col)"
+                      @change="setCellValue(row, col, ($event.target as HTMLSelectElement).value)"
                       @mousedown.stop
                       @mouseup.stop
                       @click.stop
                     >
                       <option value="">请选择</option>
                       <option
-                        v-for="option in getCellDropdownOptions(row, colIdx - 1)"
+                        v-for="option in getCellDropdownOptions(row, col)"
                         :key="option"
                         :value="option"
                       >
                         {{ option }}
                       </option>
                     </select>
-                    <span v-else class="cell-value">{{ getCellValue(row, colIdx - 1) }}</span>
+                    <span v-else class="cell-value">{{ getCellValue(row, col) }}</span>
                   </template>
                 </td>
               </template>
